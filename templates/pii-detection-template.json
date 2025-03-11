@@ -1,0 +1,730 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "PII Detection and Anonymization Solution using AWS Glue and Comprehend",
+  
+  "Parameters": {
+    "ProjectName": {
+      "Type": "String",
+      "Default": "pii-detection",
+      "Description": "Name of the project used for resource naming"
+    },
+    "RawDataBucketName": {
+      "Type": "String",
+      "Description": "Name of the S3 bucket for raw data (will be created if it doesn't exist)",
+      "Default": "pii-detection-raw-data"
+    },
+    "AnonymizedDataBucketName": {
+      "Type": "String",
+      "Description": "Name of the S3 bucket for anonymized data (will be created if it doesn't exist)",
+      "Default": "pii-detection-anonymized-data"
+    },
+    "RDSEndpoint": {
+      "Type": "String",
+      "Description": "RDS endpoint (hostname)"
+    },
+    "RDSPort": {
+      "Type": "String",
+      "Description": "RDS port",
+      "Default": "3306"
+    },
+    "RDSDatabase": {
+      "Type": "String",
+      "Description": "RDS database name"
+    },
+    "RDSUsername": {
+      "Type": "String",
+      "Description": "RDS username",
+      "NoEcho": true
+    },
+    "RDSPassword": {
+      "Type": "String",
+      "Description": "RDS password",
+      "NoEcho": true
+    },
+    "RDSTable": {
+      "Type": "String",
+      "Description": "RDS table to export",
+      "Default": "customers"
+    },
+    "RDSVPCID": {
+      "Type": "AWS::EC2::VPC::Id",
+      "Description": "VPC ID where the RDS instance is located"
+    },
+    "RDSSubnetIDs": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Subnet IDs where the RDS instance is located"
+    }
+  },
+  
+  "Conditions": {
+    "CreateVPCEndpoint": {
+      "Fn::Not": [
+        {
+          "Fn::GetAtt": ["VPCEndpointChecker", "EndpointExists"]
+        }
+      ]
+    }
+  },
+  
+  "Resources": {
+    "VPCEndpointCheckerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [{
+          "PolicyName": "VPCEndpointDescribe",
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": "ec2:DescribeVpcEndpoints",
+              "Resource": "*"
+            }]
+          }
+        }]
+      }
+    },
+    
+    "VPCEndpointCheckerFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Handler": "index.handler",
+        "Role": { "Fn::GetAtt": ["VPCEndpointCheckerRole", "Arn"] },
+        "Code": {
+          "ZipFile": "const AWS = require('aws-sdk');\nconst response = require('cfn-response');\n\nexports.handler = (event, context) => {\n  if (event.RequestType === 'Delete') {\n    return response.send(event, context, response.SUCCESS);\n  }\n\n  const ec2 = new AWS.EC2();\n  const vpcId = event.ResourceProperties.VpcId;\n  const serviceName = event.ResourceProperties.ServiceName;\n\n  ec2.describeVpcEndpoints({\n    Filters: [\n      { Name: 'vpc-id', Values: [vpcId] },\n      { Name: 'service-name', Values: [serviceName] }\n    ]\n  }).promise()\n    .then(data => {\n      const exists = data.VpcEndpoints.length > 0;\n      response.send(event, context, response.SUCCESS, { EndpointExists: exists });\n    })\n    .catch(err => {\n      console.error(err);\n      response.send(event, context, response.FAILED);\n    });\n};"
+        },
+        "Runtime": "nodejs18.x",
+        "Timeout": 30
+      }
+    },
+    
+    "VPCEndpointChecker": {
+      "Type": "Custom::VPCEndpointChecker",
+      "Properties": {
+        "ServiceToken": { "Fn::GetAtt": ["VPCEndpointCheckerFunction", "Arn"] },
+        "VpcId": { "Ref": "RDSVPCID" },
+        "ServiceName": { "Fn::Sub": "com.amazonaws.${AWS::Region}.s3" }
+      }
+    },
+    
+    "RawDataBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": {"Ref": "RawDataBucketName"},
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "LoggingConfiguration": {
+          "DestinationBucketName": {"Ref": "LoggingBucket"},
+          "LogFilePrefix": "raw-data-access-logs/"
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "AnonymizedDataBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": {"Ref": "AnonymizedDataBucketName"},
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "LoggingConfiguration": {
+          "DestinationBucketName": {"Ref": "LoggingBucket"},
+          "LogFilePrefix": "anonymized-data-access-logs/"
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "LoggingBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "AccessControl": "LogDeliveryWrite",
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "DeleteOldLogs",
+              "Status": "Enabled",
+              "ExpirationInDays": 90
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "GlueServiceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {"Fn::Sub": "${ProjectName}-GlueServiceRole"},
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "glue.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/CloudWatchFullAccess",
+          "arn:aws:iam::aws:policy/CloudWatchFullAccessV2"
+        ],
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "GlueServiceRolePolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "GlueServicePolicy",
+        "Roles": [
+          {"Ref": "GlueServiceRole"}
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                {"Fn::Sub": "arn:aws:s3:::${RawDataBucketName}"},
+                {"Fn::Sub": "arn:aws:s3:::${RawDataBucketName}/*"},
+                {"Fn::Sub": "arn:aws:s3:::${AnonymizedDataBucketName}"},
+                {"Fn::Sub": "arn:aws:s3:::${AnonymizedDataBucketName}/*"}
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                "arn:aws:logs:*:*:/aws-glue/*"
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "lambda:InvokeFunction"
+              ],
+              "Resource": [
+                {"Fn::Sub": "arn:aws:lambda:*:${AWS::AccountId}:function:bedrock-anonymization-lambda"}
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "glue:*"
+              ],
+              "Resource": [
+                {"Fn::Sub": "arn:aws:glue:*:${AWS::AccountId}:job/*"},
+                {"Fn::Sub": "arn:aws:glue:*:${AWS::AccountId}:table/*"},
+                {"Fn::Sub": "arn:aws:glue:*:${AWS::AccountId}:database/*"},
+                {"Fn::Sub": "arn:aws:glue:*:${AWS::AccountId}:catalog"}
+              ]
+            }
+          ]
+        }
+      }
+    },
+    
+    "LambdaServiceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "bedrock-lambda-role",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "LambdaBedrockPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "bedrock-lambda-policy",
+        "Roles": [
+          {"Ref": "LambdaServiceRole"}
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "bedrock:InvokeModel"
+              ],
+              "Resource": [
+                "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": "arn:aws:logs:*:*:*"
+            }
+          ]
+        }
+      }
+    },
+    
+    "RDSSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Properties": {
+        "Name": {"Fn::Sub": "${ProjectName}-rds-credentials"},
+        "Description": "RDS credentials for PII detection solution",
+        "SecretString": {"Fn::Sub": "{\"username\":\"${RDSUsername}\",\"password\":\"${RDSPassword}\"}"},
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "GlueSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Security group for Glue to connect to RDS",
+        "VpcId": {"Ref": "RDSVPCID"},
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": {"Ref": "RDSPort"},
+            "ToPort": {"Ref": "RDSPort"},
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {"Fn::Sub": "${ProjectName}-glue-sg"}
+          },
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "RDSSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Security group for RDS",
+        "VpcId": {"Ref": "RDSVPCID"},
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {"Fn::Sub": "${ProjectName}-rds-sg"}
+          },
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "RDSIngressRule": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "Description": "Allow Glue to connect to RDS",
+        "GroupId": {"Ref": "RDSSecurityGroup"},
+        "IpProtocol": "tcp",
+        "FromPort": {"Ref": "RDSPort"},
+        "ToPort": {"Ref": "RDSPort"},
+        "SourceSecurityGroupId": {"Ref": "GlueSecurityGroup"}
+      }
+    },
+    
+    "GlueRDSConnection": {
+      "Type": "AWS::Glue::Connection",
+      "Properties": {
+        "CatalogId": {"Ref": "AWS::AccountId"},
+        "ConnectionInput": {
+          "Name": {"Fn::Sub": "${ProjectName}-rds-connection"},
+          "ConnectionType": "JDBC",
+          "ConnectionProperties": {
+            "JDBC_CONNECTION_URL": {"Fn::Sub": "jdbc:mysql://${RDSEndpoint}:${RDSPort}/${RDSDatabase}"},
+            "USERNAME": {"Ref": "RDSUsername"},
+            "PASSWORD": {"Ref": "RDSPassword"}
+          },
+          "PhysicalConnectionRequirements": {
+            "AvailabilityZone": {"Fn::Select": [0, {"Fn::GetAZs": ""}]},
+            "SecurityGroupIdList": [
+              {"Ref": "GlueSecurityGroup"}
+            ],
+            "SubnetId": {"Fn::Select": [0, {"Ref": "RDSSubnetIDs"}]}
+          }
+        }
+      }
+    },
+    
+    "GlueRouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {"Ref": "RDSVPCID"},
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {"Fn::Sub": "${ProjectName}-glue-rt"}
+          },
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "GlueSubnetRouteTableAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "RouteTableId": {"Ref": "GlueRouteTable"},
+        "SubnetId": {"Fn::Select": [0, {"Ref": "RDSSubnetIDs"}]}
+      }
+    },
+    
+    "S3VPCEndpoint": {
+      "Type": "AWS::EC2::VPCEndpoint",
+      "Condition": "CreateVPCEndpoint",
+      "Properties": {
+        "ServiceName": {"Fn::Sub": "com.amazonaws.${AWS::Region}.s3"},
+        "VpcId": {"Ref": "RDSVPCID"},
+        "RouteTableIds": [
+          {"Ref": "GlueRouteTable"}
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                {"Fn::Sub": "arn:aws:s3:::${RawDataBucketName}"},
+                {"Fn::Sub": "arn:aws:s3:::${RawDataBucketName}/*"},
+                {"Fn::Sub": "arn:aws:s3:::${AnonymizedDataBucketName}"},
+                {"Fn::Sub": "arn:aws:s3:::${AnonymizedDataBucketName}/*"}
+              ]
+            }
+          ]
+        }
+      }
+    },
+    
+    "BedrockAnonymizationLambda": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "bedrock-anonymization-lambda",
+        "Handler": "lambda_function.lambda_handler",
+        "Role": {"Fn::GetAtt": ["LambdaServiceRole", "Arn"]},
+        "Runtime": "python3.9",
+        "Timeout": 300,
+        "MemorySize": 512,
+        "Code": {
+          "ZipFile": "import json\nimport boto3\nimport os\n\nbedrock_runtime = boto3.client('bedrock-runtime')\n\ndef lambda_handler(event, context):\n    prompt = event.get('prompt')\n    model_id = event.get('model', 'anthropic.claude-3-sonnet-20240229-v1:0')\n    \n    if not prompt:\n        return {\n            'statusCode': 400,\n            'body': json.dumps('Prompt is required')\n        }\n    \n    try:\n        response = bedrock_runtime.invoke_model(\n            modelId=model_id,\n            body=json.dumps({\n                \"anthropic_version\": \"bedrock-2023-05-31\",\n                \"max_tokens\": 4096,\n                \"temperature\": 0.2,\n                \"messages\": [\n                    {\n                        \"role\": \"user\",\n                        \"content\": prompt\n                    }\n                ]\n            })\n        )\n        \n        response_body = json.loads(response['body'].read().decode('utf-8'))\n        content = response_body['content'][0]['text']\n        \n        return {\n            'statusCode': 200,\n            'body': content\n        }\n    except Exception as e:\n        print(f\"Error invoking Bedrock model: {str(e)}\")\n        return {\n            'statusCode': 500,\n            'body': json.dumps(f\"Error: {str(e)}\")\n        }"
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": {"Ref": "ProjectName"}
+          }
+        ]
+      }
+    },
+    
+    "RDSExportGlueJob": {
+      "Type": "AWS::Glue::Job",
+      "Properties": {
+        "Name": {"Fn::Sub": "${ProjectName}-rds-export"},
+        "Role": {"Fn::GetAtt": ["GlueServiceRole", "Arn"]},
+        "GlueVersion": "4.0",
+        "WorkerType": "G.1X",
+        "NumberOfWorkers": 2,
+        "Timeout": 60,
+        "MaxRetries": 0,
+        "Command": {
+          "Name": "glueetl",
+          "ScriptLocation": {"Fn::Sub": "s3://${RawDataBucketName}/scripts/rds_export_script.py"}
+        },
+        "DefaultArguments": {
+          "--job-language": "python",
+          "--enable-metrics": "",
+          "--enable-continuous-cloudwatch-log": "true",
+          "--rds_endpoint": {"Ref": "RDSEndpoint"},
+          "--rds_port": {"Ref": "RDSPort"},
+          "--rds_database": {"Ref": "RDSDatabase"},
+          "--rds_table": {"Ref": "RDSTable"},
+          "--rds_secret_name": {"Ref": "RDSSecret"},
+          "--target_bucket": {"Ref": "RawDataBucketName"},
+          "--target_key": {"Fn::Sub": "raw-data/${RDSTable}.csv"}
+        },
+        "Connections": {
+          "Connections": [
+            {"Ref": "GlueRDSConnection"}
+          ]
+        },
+        "Tags": {
+          "Project": {"Ref": "ProjectName"}
+        }
+      }
+    },
+    
+    "PIIDetectionGlueJob": {
+      "Type": "AWS::Glue::Job",
+      "Properties": {
+        "Name": {"Fn::Sub": "${ProjectName}-pii-detection"},
+        "Role": {"Fn::GetAtt": ["GlueServiceRole", "Arn"]},
+        "GlueVersion": "5.0",
+        "WorkerType": "G.1X",
+        "NumberOfWorkers": 2,
+        "Timeout": 480,
+        "MaxRetries": 0,
+        "Command": {
+          "Name": "glueetl",
+          "ScriptLocation": {"Fn::Sub": "s3://${RawDataBucketName}/scripts/glue_pii_detect_api_v3.py"}
+        },
+        "DefaultArguments": {
+          "--job-language": "python",
+          "--enable-metrics": "",
+          "--enable-continuous-cloudwatch-log": "true",
+          "--additional-python-modules": "pandas",
+          "--source_bucket": {"Ref": "RawDataBucketName"},
+          "--source_key": {"Fn::Sub": "raw-data/${RDSTable}.csv"},
+          "--target_bucket": {"Ref": "AnonymizedDataBucketName"},
+          "--target_prefix": "anonymized-data"
+        },
+        "Tags": {
+          "Project": {"Ref": "ProjectName"}
+        }
+      }
+    },
+    
+    "GlueJobFailureAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {"Fn::Sub": "${ProjectName}-glue-job-failure"},
+        "AlarmDescription": "Alarm when any Glue job fails",
+        "MetricName": "glue.driver.aggregate.numFailedTasks",
+        "Namespace": "Glue",
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+      }
+    },
+    
+    "PIIDetectionJobFailureAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {"Fn::Sub": "${ProjectName}-pii-detection-job-failure"},
+        "AlarmDescription": "Alarm when PII detection job fails",
+        "MetricName": "glue.driver.aggregate.numFailedTasks",
+        "Namespace": "Glue",
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+      }
+    },
+    
+    "PIIDetectionWorkflow": {
+      "Type": "AWS::Glue::Workflow",
+      "Properties": {
+        "Name": {"Fn::Sub": "${ProjectName}-workflow"},
+        "Description": "Workflow to export data from RDS, detect PII, and anonymize",
+        "Tags": {
+          "Project": {"Ref": "ProjectName"}
+        }
+      }
+    },
+    
+    "RDSExportTrigger": {
+      "Type": "AWS::Glue::Trigger",
+      "Properties": {
+        "Name": {"Fn::Sub": "${ProjectName}-rds-export-trigger"},
+        "Type": "ON_DEMAND",
+        "WorkflowName": {"Ref": "PIIDetectionWorkflow"},
+        "Actions": [
+          {
+            "JobName": {"Ref": "RDSExportGlueJob"}
+          }
+        ],
+        "Tags": {
+          "Project": {"Ref": "ProjectName"}
+        }
+      }
+    },
+    
+    "PIIDetectionTrigger": {
+      "Type": "AWS::Glue::Trigger",
+      "Properties": {
+        "Name": {"Fn::Sub": "${ProjectName}-pii-detection-trigger"},
+        "Type": "CONDITIONAL",
+        "WorkflowName": {"Ref": "PIIDetectionWorkflow"},
+        "StartOnCreation": true,
+        "Predicate": {
+          "Conditions": [
+            {
+              "LogicalOperator": "EQUALS",
+              "JobName": {"Ref": "RDSExportGlueJob"},
+              "State": "SUCCEEDED"
+            }
+          ]
+        },
+        "Actions": [
+          {
+            "JobName": {"Ref": "PIIDetectionGlueJob"}
+          }
+        ],
+        "Tags": {
+          "Project": {"Ref": "ProjectName"}
+        }
+      }
+    }
+  },
+  
+  "Outputs": {
+    "RawDataBucketName": {
+      "Description": "Name of the S3 bucket for raw data",
+      "Value": {"Ref": "RawDataBucket"}
+    },
+    "AnonymizedDataBucketName": {
+      "Description": "Name of the S3 bucket for anonymized data",
+      "Value": {"Ref": "AnonymizedDataBucket"}
+    },
+    "WorkflowName": {
+      "Description": "Name of the Glue workflow",
+      "Value": {"Ref": "PIIDetectionWorkflow"}
+    },
+    "RDSExportJobName": {
+      "Description": "Name of the RDS export Glue job",
+      "Value": {"Ref": "RDSExportGlueJob"}
+    },
+    "PIIDetectionJobName": {
+      "Description": "Name of the PII detection Glue job",
+      "Value": {"Ref": "PIIDetectionGlueJob"}
+    }
+  }
+}
